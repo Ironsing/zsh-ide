@@ -24,6 +24,13 @@
         "configuration": "./language-configuration.json"
       }
     ],
+    "grammars": [
+      {
+        "language": "zsh",
+        "scopeName": "source.zsh",
+        "path": "./syntaxes/zsh.tmLanguage.json"
+      }
+    ],
     "commands": [
       {
         "command": "zsh-ide.showServerOutput",
