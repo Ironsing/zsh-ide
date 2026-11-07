@@ -28,11 +28,11 @@
       {
         "command": "zsh-ide.showServerOutput",
         "title": "Show Server Output",
-        "category": "zsh-ide"
+        "category": "Zsh IDE"
       }
     ],
     "configuration": {
-      "title": "zsh-ide",
+      "title": "Zsh IDE",
       "properties": {
         "zsh-ide.serverPath": {
           "type": "string",

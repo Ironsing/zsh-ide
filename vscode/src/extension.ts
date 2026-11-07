@@ -38,7 +38,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const command = resolveServerPath(context);
 	if (!command) {
 		void vscode.window.showWarningMessage(
-			`zsh-ide: no server binary found. Build it with 'cargo build' in zsh-ls/ and set "zsh-ide.serverPath" if it's somewhere else.`,
+			`Zsh IDE: no server binary found. Build it with 'cargo build' in zsh-ls/ and set "zsh-ide.serverPath" if it's somewhere else.`,
 		);
 		return;
 	}
@@ -46,7 +46,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// vscode-languageclient pipes the server's stderr here, one log entry per
 	// line, so anything zsh-ls writes with eprintln! is readable from the
 	// Output panel (or via the zsh-ide.showServerOutput command).
-	const outputChannel = vscode.window.createOutputChannel('zsh-ide', { log: true });
+	const outputChannel = vscode.window.createOutputChannel('Zsh IDE', { log: true });
 	context.subscriptions.push(
 		outputChannel,
 		vscode.commands.registerCommand('zsh-ide.showServerOutput', () => outputChannel.show()),
@@ -64,7 +64,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		outputChannel,
 	};
 
-	client = new LanguageClient('zsh-ide', 'zsh-ide', serverOptions, clientOptions);
+	client = new LanguageClient('zsh-ide', 'Zsh IDE', serverOptions, clientOptions);
 	context.subscriptions.push(client);
 	await client.start();
 }
