@@ -1,0 +1,10 @@
+[package]
+name = "zsh-lsp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread"] }
+tree-sitter = "0.25"
+tree-sitter-zsh = "0.63"
+tower-lsp-server = "0.23"
