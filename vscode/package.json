@@ -3,6 +3,7 @@
   "displayName": "Zsh IDE",
   "description": "zsh language support powered by the zsh-ls language server",
   "version": "0.0.1",
+  "license": "MIT",
   "engines": {
     "vscode": "^1.145.0"
   },
