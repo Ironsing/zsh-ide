@@ -1,29 +1,33 @@
-//! Handles document synchronization.
+//! Maintains the language server's in-memory representation of open documents.
+//!
+//! Documents are indexed by URI and synchronized with the client through
+//! `didOpen`, `didChange`, and `didClose` notifications.
 
 use std::collections::HashMap;
 use std::fmt;
 
 use tower_lsp_server::ls_types::{DidChangeTextDocumentParams, TextDocumentItem, Uri};
 
-/// A single open document.
+/// The server's current representation of an open text document.
 #[derive(Debug, Clone)]
 pub struct Document {
-    /// Full text.
+    /// The document's complete text, preserved verbatim.
     pub text: String,
-    /// The latest version so far, obtained from the LSP client.
+
+    /// The client's version number for this document.
     pub version: i32,
 }
 
-/// A map of all open documents, keyed by location.
+/// Stores the documents currently open in the client.
 #[derive(Debug, Default)]
 pub struct DocumentStore {
     documents: HashMap<Uri, Document>,
 }
 
-/// Errors that can occur while applying a document change.
+/// An error encountered while synchronizing a document.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncError {
-    /// A change was received for a document that is not currently open.
+    /// A change notification was received for a document that is not open.
     UnknownDocument,
 }
 
@@ -38,7 +42,11 @@ impl fmt::Display for SyncError {
 impl std::error::Error for SyncError {}
 
 impl DocumentStore {
-    /// Handle `textDocument/didOpen`.
+    /// Opens a document, inserting it into the store.
+    ///
+    /// If a document with the same URI already exists, it is replaced.
+    ///
+    /// Returns the previous document, if one existed.
     pub fn open(&mut self, item: TextDocumentItem) -> Option<Document> {
         let previous = self.documents.insert(
             item.uri,
@@ -51,7 +59,9 @@ impl DocumentStore {
         previous
     }
 
-    /// Handle `textDocument/didClose`.
+    /// Closes a document, removing it from the store.
+    ///
+    /// Returns the removed document, or `None` if it was not open.
     pub fn close(&mut self, uri: &Uri) -> Option<Document> {
         let removed = self.documents.remove(uri);
         if removed.is_some() {
@@ -60,9 +70,17 @@ impl DocumentStore {
         removed
     }
 
-    /// Handle `textDocument/didChange`.
-    /// A change carrying a version older than the one on record is ignored.
-    /// An empty `content_changes` list only bumps the version.
+    /// Applies a document change notification.
+    ///
+    /// Only full-document replacements are supported. If multiple content
+    /// changes are supplied, only the last one is used.
+    ///
+    /// Notifications with a version older than the stored version are
+    /// silently ignored.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SyncError::UnknownDocument`] if the document is not open.
     pub fn change(&mut self, params: DidChangeTextDocumentParams) -> Result<(), SyncError> {
         let doc = self
             .documents
@@ -82,33 +100,29 @@ impl DocumentStore {
         Ok(())
     }
 
-    /// Get the document for a URI, if open.
+    /// Returns a reference to an open document.
+    ///
+    /// Returns `None` if no document with the given URI exists.
     pub fn get(&self, uri: &Uri) -> Option<&Document> {
         self.documents.get(uri)
     }
 
-    /// Number of open documents.
+    /// Returns the number of currently open documents.
     pub fn len(&self) -> usize {
         self.documents.len()
     }
 
-    /// Whether no documents are open.
+    /// Returns whether the store contains no open documents.
     pub fn is_empty(&self) -> bool {
         self.documents.is_empty()
     }
 
-    /// Dump the whole store to stderr.
-    ///
-    /// The editor forwards the server's stderr to an output channel, so this is
-    /// how document synchronization can be watched from the UI.
     fn trace(&self, event: &str) {
         eprintln!("zsh-lsp: {event}\n{}", self);
     }
 }
 
 impl fmt::Display for DocumentStore {
-    /// Pretty-print every open document, sorted by URI so that the output is
-    /// stable from one call to the next.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} open document(s)", self.documents.len())?;
 
