@@ -4,11 +4,13 @@ use tower_lsp_server::LanguageServer;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    InitializeParams, InitializeResult, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+    FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability, InitializeParams,
+    InitializeResult, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
     TextDocumentSyncKind,
 };
 
 use crate::documents::DocumentStore;
+use crate::folding::get_folding_ranges;
 
 /// The language server.
 #[derive(Debug, Default)]
@@ -40,6 +42,7 @@ impl LanguageServer for Server {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::FULL,
                 )),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 ..Default::default()
             },
             server_info: Some(ServerInfo {
@@ -62,6 +65,21 @@ impl LanguageServer for Server {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         self.store().close(&params.text_document.uri);
+    }
+
+    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
+        let store = self.store();
+        let ranges = store.get(&params.text_document.uri).map(|doc| {
+            get_folding_ranges(&doc.tree)
+                .into_iter()
+                .map(|(start_line, end_line)| FoldingRange {
+                    start_line,
+                    end_line,
+                    ..Default::default()
+                })
+                .collect()
+        });
+        Ok(ranges)
     }
 
     async fn shutdown(&self) -> Result<()> {
