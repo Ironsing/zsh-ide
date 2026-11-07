@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use tower_lsp_server::ls_types::{DidChangeTextDocumentParams, TextDocumentItem, Uri};
+use tree_sitter::{Parser, Tree};
 
 /// The server's current representation of an open text document.
 #[derive(Debug, Clone)]
@@ -16,12 +17,17 @@ pub struct Document {
 
     /// The client's version number for this document.
     pub version: i32,
+
+    /// The parsed syntax tree for `text`. Completely re-parsed on every change.
+    pub tree: Tree,
 }
 
 /// Stores the documents currently open in the client.
-#[derive(Debug, Default)]
 pub struct DocumentStore {
     documents: HashMap<Uri, Document>,
+
+    /// Parser reused across documents, set to the zsh grammar.
+    parser: Parser,
 }
 
 /// An error encountered while synchronizing a document.
@@ -41,6 +47,28 @@ impl fmt::Display for SyncError {
 
 impl std::error::Error for SyncError {}
 
+impl fmt::Debug for DocumentStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // `Parser` is not `Debug`, so skip it (and future fields) explicitly.
+        f.debug_struct("DocumentStore")
+            .field("documents", &self.documents)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DocumentStore {
+    fn default() -> Self {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&tree_sitter_zsh::LANGUAGE.into())
+            .expect("zsh grammar is valid");
+        Self {
+            documents: HashMap::new(),
+            parser,
+        }
+    }
+}
+
 impl DocumentStore {
     /// Opens a document, inserting it into the store.
     ///
@@ -48,11 +76,13 @@ impl DocumentStore {
     ///
     /// Returns the previous document, if one existed.
     pub fn open(&mut self, item: TextDocumentItem) -> Option<Document> {
+        let tree = Self::parse(&mut self.parser, &item.text);
         let previous = self.documents.insert(
             item.uri,
             Document {
                 text: item.text,
                 version: item.version,
+                tree,
             },
         );
         self.trace("didOpen");
@@ -93,11 +123,21 @@ impl DocumentStore {
 
         if let Some(change) = params.content_changes.last() {
             doc.text.clone_from(&change.text);
+            doc.tree = Self::parse(&mut self.parser, &doc.text);
         }
 
         doc.version = params.text_document.version;
         self.trace("didChange");
         Ok(())
+    }
+
+    /// Parses `text` in full, returning the parse tree.
+    /// Takes `&mut Parser` rather than `&mut self` so callers can
+    /// borrow the parser and the document map as disjoint fields.
+    fn parse(parser: &mut Parser, text: &str) -> Tree {
+        parser
+            .parse(text, None)
+            .expect("tree-sitter returns a tree once a language is set")
     }
 
     /// Returns a reference to an open document.
@@ -192,6 +232,17 @@ mod tests {
     }
 
     #[test]
+    fn open_parses_tree() {
+        let mut store = DocumentStore::default();
+        store.open(open_params("/tmp/a.zsh", 1, "echo a\n"));
+
+        let doc = store.get(&uri("/tmp/a.zsh")).expect("document is open");
+        let root = doc.tree.root_node();
+        assert_eq!(root.kind(), "program");
+        assert!(!root.has_error());
+    }
+
+    #[test]
     fn open_duplicate_returns_previous() {
         let mut store = DocumentStore::default();
         store.open(open_params("/tmp/a.zsh", 1, "echo a\n"));
@@ -235,6 +286,28 @@ mod tests {
         let doc = store.get(&uri("/tmp/a.zsh")).expect("document is open");
         assert_eq!(doc.text, "echo a\necho b\n");
         assert_eq!(doc.version, 2);
+    }
+
+    #[test]
+    fn change_reparses_tree() {
+        let mut store = DocumentStore::default();
+        store.open(open_params("/tmp/a.zsh", 1, "echo a\n"));
+
+        let before = store
+            .get(&uri("/tmp/a.zsh"))
+            .expect("document is open")
+            .tree
+            .root_node()
+            .named_child_count();
+
+        store
+            .change(change_params("/tmp/a.zsh", 2, &["echo a\necho b\necho c\n"]))
+            .expect("change applies");
+
+        let doc = store.get(&uri("/tmp/a.zsh")).expect("document is open");
+        let root = doc.tree.root_node();
+        assert!(!root.has_error());
+        assert!(root.named_child_count() > before);
     }
 
     #[test]
