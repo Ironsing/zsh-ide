@@ -1,2 +1,1 @@
-- Implement folding ranges
 - Implement document symbols
