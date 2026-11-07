@@ -1,0 +1,3 @@
+- Include a LICENSE
+- Implement folding ranges
+- Implement document symbols
