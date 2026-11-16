@@ -1,6 +1,7 @@
 mod documents;
 mod folding;
 mod server;
+mod symbols;
 
 use tower_lsp_server::{LspService, Server as LspServer};
 
