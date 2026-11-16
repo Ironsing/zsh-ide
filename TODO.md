@@ -1,1 +1,8 @@
-- Implement document symbols
+- Fix bug: empty assignment selection range is too wide
+- Jump to declaration
+- Find references
+- Highlight occurrences
+- Code completion
+- Rename symbol
+- Snippets
+- Dramatically improve the textmate grammar
