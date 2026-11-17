@@ -10,4 +10,8 @@ zsh-ls/ contains a language server written in Rust. It uses tree-sitter and tree
 
 ## Git
 
+### Commit style
 Short, lowercase-only, imperative commit messages with no body unless explicitly asked for by the user.
+
+### Other instructions
+Some users require you to automatically make commits in the repo's style; others prefer authoring history themselves with some exceptions where they delegate to you. Ask the user which they are on first contact rather than guessing.
