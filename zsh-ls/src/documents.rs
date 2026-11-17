@@ -301,7 +301,11 @@ mod tests {
             .named_child_count();
 
         store
-            .change(change_params("/tmp/a.zsh", 2, &["echo a\necho b\necho c\n"]))
+            .change(change_params(
+                "/tmp/a.zsh",
+                2,
+                &["echo a\necho b\necho c\n"],
+            ))
             .expect("change applies");
 
         let doc = store.get(&uri("/tmp/a.zsh")).expect("document is open");

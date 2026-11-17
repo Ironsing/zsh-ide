@@ -1,3 +1,4 @@
+mod analysis;
 mod documents;
 mod folding;
 mod server;

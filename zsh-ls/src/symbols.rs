@@ -10,7 +10,9 @@
 use std::collections::HashSet;
 
 use tower_lsp_server::ls_types::{DocumentSymbol, Position, Range, SymbolKind};
-use tree_sitter::{Node, Tree, TreeCursor};
+use tree_sitter::Node;
+
+use crate::analysis::Analyzer;
 
 /// Command names that pull another file into the current shell.
 const SOURCE_COMMANDS: &[&str] = &["source", "."];
@@ -24,96 +26,90 @@ const ASSOCIATIVE_ARRAY_FLAG: char = 'A';
 /// The name reported for lamba functions, e.g. `() { echo hi }`.
 const ANONYMOUS_FUNCTION_NAME: &str = "Anon function";
 
-/// Every symbol in `tree`: the `source`/`.` commands, the aliases and the
-/// function definitions, in document order.
-pub fn get_symbols(tree: &Tree, text: &str) -> Vec<DocumentSymbol> {
-    let mut symbols = get_source_symbols(tree, text);
-    symbols.extend(get_alias_symbols(tree, text));
-    symbols.extend(get_function_symbols(tree, text));
-    symbols.extend(get_variable_symbols(tree, text));
+/// Collects the document symbols of one document.
+#[derive(Debug, Default)]
+pub struct SymbolAnalyzer {
+    symbols: Vec<DocumentSymbol>,
 
-    // The kinds are gathered separately, so interleave them by start.
-    symbols.sort_by_key(|symbol| (symbol.range.start.line, symbol.range.start.character));
-    symbols
+    // Assignments already reported as associative arrays, so we can dedup
+    // with the general assignment case.
+    claimed: HashSet<usize>,
 }
 
-/// Returns a [`SymbolKind::FUNCTION`] symbol for every function definition.
-fn get_function_symbols(tree: &Tree, text: &str) -> Vec<DocumentSymbol> {
-    nodes_of_kind(tree, "function_definition")
-        .into_iter()
-        .filter_map(|node| function_symbol(node, text))
-        .collect()
+impl SymbolAnalyzer {
+    /// The symbols found, in document order.
+    pub fn symbols(&self) -> &[DocumentSymbol] {
+        &self.symbols
+    }
+
+    /// A `command` is a symbol when it is `source`/`.` or `alias`.
+    fn visit_command(&mut self, command: Node<'_>, text: &str) {
+        let name = command_name(command, text);
+        let symbol = if SOURCE_COMMANDS.contains(&name) {
+            source_symbol(command, text)
+        } else if name == ALIAS_COMMAND {
+            alias_symbol(command, text)
+        } else {
+            None
+        };
+
+        if let Some(symbol) = symbol {
+            self.symbols.push(symbol);
+        }
+    }
+
+    /// A declaration command carrying `-A` declares associative arrays, so its
+    /// assignments are reported here and skipped by [`Self::visit_assignment`].
+    ///
+    /// The declaration is visited before its children, so claiming them here
+    /// holds for the rest of the traversal.
+    fn visit_declaration(&mut self, command: Node<'_>, text: &str) {
+        if !declares_associative_array(command, text) {
+            return;
+        }
+
+        for assignment in assignment_children(command) {
+            self.claimed.insert(assignment.id());
+            self.symbols
+                .push(variable_symbol(assignment, SymbolKind::OBJECT, text));
+        }
+    }
+
+    /// Every other assignment: an array when its value is a non-empty array, and
+    /// a plain variable otherwise.
+    fn visit_assignment(&mut self, node: Node<'_>, text: &str) {
+        if self.claimed.contains(&node.id()) {
+            return;
+        }
+
+        let kind = if is_non_empty_array(node) {
+            SymbolKind::ARRAY
+        } else {
+            SymbolKind::VARIABLE
+        };
+        self.symbols.push(variable_symbol(node, kind, text));
+    }
 }
 
-/// Returns a [`SymbolKind::MODULE`] symbol for every `source`/`.` command.
-fn get_source_symbols(tree: &Tree, text: &str) -> Vec<DocumentSymbol> {
-    command_nodes(tree)
-        .into_iter()
-        .filter(|command| SOURCE_COMMANDS.contains(&command_name(*command, text)))
-        .filter_map(|command| source_symbol(command, text))
-        .collect()
-}
+impl Analyzer for SymbolAnalyzer {
+    fn reset(&mut self) {
+        self.symbols.clear();
+        self.claimed.clear();
+    }
 
-/// Returns a [`SymbolKind::CONSTANT`] symbol for every alias defined with the
-/// `alias` command.
-fn get_alias_symbols(tree: &Tree, text: &str) -> Vec<DocumentSymbol> {
-    command_nodes(tree)
-        .into_iter()
-        .filter(|command| command_name(*command, text) == ALIAS_COMMAND)
-        .filter_map(|command| alias_symbol(command, text))
-        .collect()
-}
-
-/// Returns a symbol for every variable assignment: [`SymbolKind::OBJECT`] for
-/// associative arrays, [`SymbolKind::ARRAY`] for arrays and
-/// [`SymbolKind::VARIABLE`] for every other form.
-fn get_variable_symbols(tree: &Tree, text: &str) -> Vec<DocumentSymbol> {
-    // Dedup because each is a superset of the previous.
-    // Array assignments are associative array assignments,
-    // And they're also normal assignments.
-    let passes = [
-        (
-            get_associative_array_assignments(tree, text),
-            SymbolKind::OBJECT,
-        ),
-        (get_array_assignments(tree), SymbolKind::ARRAY),
-        (get_all_assignments(tree), SymbolKind::VARIABLE),
-    ];
-
-    let mut seen = HashSet::new();
-    let mut symbols: Vec<DocumentSymbol> = passes
-        .into_iter()
-        .flat_map(|(nodes, kind)| nodes.into_iter().map(move |node| (node, kind)))
-        .filter(|(node, _)| seen.insert(node.id()))
-        .map(|(node, kind)| variable_symbol(node, kind, text))
-        .collect();
-
-    // The passes are grouped by kind, so interleave them by start.
-    symbols.sort_by_key(|symbol| (symbol.range.start.line, symbol.range.start.character));
-    symbols
-}
-
-/// The `variable_assignment` children of every `-A` declaration command, e.g.
-/// the `ASSOC=( ... )` in `declare -A ASSOC=( ... )`.
-fn get_associative_array_assignments<'a>(tree: &'a Tree, text: &str) -> Vec<Node<'a>> {
-    nodes_of_kind(tree, "declaration_command")
-        .into_iter()
-        .filter(|command| declares_associative_array(*command, text))
-        .flat_map(assignment_children)
-        .collect()
-}
-
-/// The assignments whose `value` is a non-empty `array`.
-fn get_array_assignments<'a>(tree: &'a Tree) -> Vec<Node<'a>> {
-    get_all_assignments(tree)
-        .into_iter()
-        .filter(|assignment| is_non_empty_array(*assignment))
-        .collect()
-}
-
-/// Every `variable_assignment` node in `tree`.
-fn get_all_assignments<'a>(tree: &'a Tree) -> Vec<Node<'a>> {
-    nodes_of_kind(tree, "variable_assignment")
+    fn visit(&mut self, node: Node<'_>, text: &str) {
+        match node.kind() {
+            "command" => self.visit_command(node, text),
+            "function_definition" => {
+                if let Some(symbol) = function_symbol(node, text) {
+                    self.symbols.push(symbol);
+                }
+            }
+            "declaration_command" => self.visit_declaration(node, text),
+            "variable_assignment" => self.visit_assignment(node, text),
+            _ => {}
+        }
+    }
 }
 
 /// Whether a `declaration_command` carries the `-A` flag, which declares the
@@ -141,37 +137,6 @@ fn assignment_children<'a>(node: Node<'a>) -> Vec<Node<'a>> {
     node.named_children(&mut cursor)
         .filter(|child| child.kind() == "variable_assignment")
         .collect()
-}
-
-/// Every `command` node in `tree`, in source order.
-fn command_nodes<'a>(tree: &'a Tree) -> Vec<Node<'a>> {
-    nodes_of_kind(tree, "command")
-}
-
-/// Every node of `kind` in `tree`, in source order.
-fn nodes_of_kind<'a>(tree: &'a Tree, kind: &str) -> Vec<Node<'a>> {
-    let mut nodes = Vec::new();
-    let mut cursor = tree.walk();
-    collect_nodes(&mut cursor, kind, &mut nodes);
-    nodes
-}
-
-/// Depth-first walk, collecting every node it visits whose kind is `kind`.
-fn collect_nodes<'a>(cursor: &mut TreeCursor<'a>, kind: &str, nodes: &mut Vec<Node<'a>>) {
-    let node = cursor.node();
-    if node.kind() == kind {
-        nodes.push(node);
-    }
-
-    if cursor.goto_first_child() {
-        loop {
-            collect_nodes(cursor, kind, nodes);
-            if !cursor.goto_next_sibling() {
-                break;
-            }
-        }
-        cursor.goto_parent();
-    }
 }
 
 /// Builds a symbol for a `source`/`.` command, named after its file argument.
@@ -366,7 +331,7 @@ fn strip_quotes(value: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tree_sitter::Parser;
+    use tree_sitter::{Parser, Tree};
 
     fn parse(text: &str) -> Tree {
         let mut parser = Parser::new();
@@ -374,6 +339,14 @@ mod tests {
             .set_language(&tree_sitter_zsh::LANGUAGE.into())
             .expect("zsh grammar is valid");
         parser.parse(text, None).expect("tree is produced")
+    }
+
+    /// The symbols the analyzer finds for `text`, parsed on its own.
+    fn symbols_of(text: &str) -> Vec<DocumentSymbol> {
+        let tree = parse(text);
+        let mut analyzer = SymbolAnalyzer::default();
+        crate::analysis::run(&tree, text, &mut [&mut analyzer]);
+        analyzer.symbols().to_vec()
     }
 
     /// An LSP range, with every position on `line`.
@@ -393,7 +366,7 @@ mod tests {
     #[test]
     fn source_command_yields_module_symbol() {
         let text = "source ~/.zshrc\n";
-        let symbols = get_source_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "~/.zshrc");
         assert_eq!(symbols[0].kind, SymbolKind::MODULE);
@@ -403,7 +376,7 @@ mod tests {
     #[test]
     fn dot_command_yields_module_symbol() {
         let text = ". ./lib.zsh\n";
-        let symbols = get_source_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "./lib.zsh");
     }
@@ -411,7 +384,7 @@ mod tests {
     #[test]
     fn alias_command_yields_constant_symbol() {
         let text = "alias lzg=\"lazygit\"\n";
-        let symbols = get_alias_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "lzg");
         assert_eq!(symbols[0].kind, SymbolKind::CONSTANT);
@@ -421,7 +394,7 @@ mod tests {
     #[test]
     fn unquoted_alias_yields_constant_symbol() {
         let text = "alias l=lazygit\n";
-        let symbols = get_alias_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "l");
         assert_eq!(symbols[0].detail.as_deref(), Some("Alias for lazygit"));
@@ -430,23 +403,21 @@ mod tests {
     #[test]
     fn source_and_alias_are_distinct() {
         let text = "source ~/.zshrc\nalias l=lazygit\n";
-        let tree = parse(text);
-        assert_eq!(get_source_symbols(&tree, text).len(), 1);
-        assert_eq!(get_alias_symbols(&tree, text).len(), 1);
+        let symbols = symbols_of(text);
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].kind, SymbolKind::MODULE);
+        assert_eq!(symbols[1].kind, SymbolKind::CONSTANT);
     }
 
     #[test]
     fn unrelated_commands_yield_nothing() {
-        let text = "echo hi\nls -la\n";
-        let tree = parse(text);
-        assert!(get_source_symbols(&tree, text).is_empty());
-        assert!(get_alias_symbols(&tree, text).is_empty());
+        assert!(symbols_of("echo hi\nls -la\n").is_empty());
     }
 
     #[test]
-    fn get_symbols_interleaves_sources_and_aliases_in_document_order() {
+    fn symbols_interleave_sources_and_aliases_in_document_order() {
         let text = "alias a=1\nsource ~/.zshrc\nalias b=2\n. ./lib.zsh\n";
-        let symbols = get_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
 
         let names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
         assert_eq!(names, ["a", "~/.zshrc", "b", "./lib.zsh"]);
@@ -455,7 +426,7 @@ mod tests {
     #[test]
     fn range_and_selection_range_are_decoupled() {
         let text = "alias lzg=\"lazygit\"\n";
-        let symbols = get_alias_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
 
         let symbol = &symbols[0];
@@ -466,7 +437,7 @@ mod tests {
     #[test]
     fn source_selection_covers_the_file_argument() {
         let text = "source \"~/.zshrc\"\n";
-        let symbols = get_source_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
 
         let symbol = &symbols[0];
@@ -481,7 +452,7 @@ mod tests {
         // `alias l='é🌍'` is 16 bytes but 13 UTF-16 code units: `é` is 2 bytes
         // in 1 unit and `🌍` is 4 bytes in 2 units.
         let text = "alias l='é🌍'\n";
-        let symbols = get_alias_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
 
         let symbol = &symbols[0];
@@ -494,7 +465,7 @@ mod tests {
     fn multibyte_text_before_a_symbol_shifts_its_start() {
         // `é` is 2 bytes, so the alias command starts at byte 10 but unit 9.
         let text = "écho hi; alias l=x\n";
-        let symbols = get_alias_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
 
         let symbol = &symbols[0];
@@ -515,7 +486,7 @@ mod tests {
             "function foo()\n{\n  echo hi\n}\n",
             "foo() (\n  echo hi\n)\n",
         ] {
-            let symbols = get_symbols(&parse(text), text);
+            let symbols = symbols_of(text);
             assert_eq!(symbols.len(), 1, "no symbol for {text:?}");
             assert_eq!(symbols[0].name, "foo", "wrong name for {text:?}");
             assert_eq!(symbols[0].kind, SymbolKind::FUNCTION);
@@ -526,7 +497,7 @@ mod tests {
     fn anonymous_function_yields_anon_function_symbol() {
         // `() { ... }` is a zsh 5.4 anonymous function; it has no `name` child.
         let text = "() {\n  echo hi\n}\n";
-        let symbols = get_function_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "Anon function");
         assert_eq!(symbols[0].kind, SymbolKind::FUNCTION);
@@ -538,7 +509,7 @@ mod tests {
     #[test]
     fn nested_and_sibling_functions_yield_a_symbol_each() {
         let text = "outer() {\n  inner() {\n    echo hi\n  }\n}\nbuild() {\n  echo hi\n}\n";
-        let symbols = get_function_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
 
         let names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
         assert_eq!(names, ["outer", "inner", "build"]);
@@ -547,7 +518,7 @@ mod tests {
     #[test]
     fn function_range_spans_the_body_while_selection_covers_the_name() {
         let text = "foo() { echo hi; }\n";
-        let symbols = get_function_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
 
         let symbol = &symbols[0];
@@ -561,7 +532,7 @@ mod tests {
     fn plain_assignments_yield_variable_symbols() {
         // `EMPTY=` goes last: the grammar takes the next line's word as its value.
         let text = "PLAIN=value\nAPPENDED+=more\nEMPTY=\n";
-        let symbols = get_variable_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
 
         let names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
         assert_eq!(names, ["PLAIN", "APPENDED", "EMPTY"]);
@@ -577,7 +548,7 @@ mod tests {
         // The grammar reads the word on the next line as the value of `EMPTY=`,
         // so the second assignment is not a node of its own.
         let text = "EMPTY=\nSWALLOWED=value\n";
-        let symbols = get_variable_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
 
         let names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
         assert_eq!(names, ["EMPTY"]);
@@ -598,7 +569,7 @@ mod tests {
             "A=(k=v)",
         ] {
             let text = format!("{text}\n");
-            let symbols = get_variable_symbols(&parse(&text), &text);
+            let symbols = symbols_of(&text);
             assert_eq!(symbols.len(), 1, "wrong symbol count for {text:?}");
             assert_eq!(symbols[0].name, "A", "wrong name for {text:?}");
             assert_eq!(
@@ -613,7 +584,7 @@ mod tests {
     fn array_declarations_inside_a_declaration_command_yield_an_array_symbol() {
         // Without `-A`, `declare` declares an ordinary array.
         let text = "declare ARR=(a b)\n";
-        let symbols = get_variable_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "ARR");
         assert_eq!(symbols[0].kind, SymbolKind::ARRAY);
@@ -628,7 +599,7 @@ mod tests {
             "local -A LOCAL=( [k]=v )\n",
             "typeset -A TYPESET=( [k]=v )\n",
         ] {
-            let symbols = get_variable_symbols(&parse(text), text);
+            let symbols = symbols_of(text);
             assert_eq!(symbols.len(), 1, "wrong symbol count for {text:?}");
             assert_eq!(
                 symbols[0].kind,
@@ -641,7 +612,7 @@ mod tests {
     #[test]
     fn declaration_without_an_assignment_yields_no_symbol() {
         let text = "declare -A BARE\ndeclare -x OTHER\n";
-        assert!(get_variable_symbols(&parse(text), text).is_empty());
+        assert!(symbols_of(text).is_empty());
     }
 
     #[test]
@@ -649,11 +620,7 @@ mod tests {
         // Every array and associative array is also a plain
         // `variable_assignment`, so three traversals would report it thrice.
         for text in ["A=(a b)\n", "declare -A A=( [k]=v )\n", "A=()\n", "A=x\n"] {
-            assert_eq!(
-                get_variable_symbols(&parse(text), text).len(),
-                1,
-                "for {text:?}"
-            );
+            assert_eq!(symbols_of(text).len(), 1, "for {text:?}");
         }
     }
 
@@ -661,7 +628,7 @@ mod tests {
     fn empty_array_falls_back_to_a_variable_symbol() {
         // With no elements there is nothing to tell an array from an empty value.
         let text = "EMPTY_ARRAY=()\n";
-        let symbols = get_variable_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].kind, SymbolKind::VARIABLE);
     }
@@ -669,7 +636,7 @@ mod tests {
     #[test]
     fn several_assignments_yield_a_symbol_each() {
         let text = "FIRST=one SECOND=two\n";
-        let symbols = get_variable_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
 
         let names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
         assert_eq!(names, ["FIRST", "SECOND"]);
@@ -678,7 +645,7 @@ mod tests {
     #[test]
     fn assignment_prefixing_a_command_yields_a_variable_symbol() {
         let text = "PREFIX=value some_command\n";
-        let symbols = get_variable_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
         assert_eq!(symbols[0].name, "PREFIX");
         assert_eq!(symbols[0].kind, SymbolKind::VARIABLE);
@@ -687,7 +654,7 @@ mod tests {
     #[test]
     fn subscripted_assignment_is_named_after_its_subscript() {
         let text = "INDEXED[2]=value\n";
-        let symbols = get_variable_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
         assert_eq!(symbols.len(), 1);
 
         let symbol = &symbols[0];
@@ -699,7 +666,7 @@ mod tests {
     #[test]
     fn expansion_right_hand_sides_yield_variable_symbols() {
         let text = "FROM_VAR=${OTHER}\nFROM_COMMAND=$(echo hi)\nFROM_ARITHMETIC=$((1 + 2))\n";
-        let symbols = get_variable_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
 
         let names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
         assert_eq!(names, ["FROM_VAR", "FROM_COMMAND", "FROM_ARITHMETIC"]);
@@ -713,7 +680,7 @@ mod tests {
     #[test]
     fn variables_interleave_with_the_other_symbols() {
         let text = "alias l=x\nFOO=bar\nfoo() { echo hi }\n";
-        let symbols = get_symbols(&parse(text), text);
+        let symbols = symbols_of(text);
 
         let names: Vec<&str> = symbols.iter().map(|symbol| symbol.name.as_str()).collect();
         assert_eq!(names, ["l", "FOO", "foo"]);

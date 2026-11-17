@@ -6,12 +6,11 @@ use tower_lsp_server::ls_types::{
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DocumentSymbolParams, DocumentSymbolResponse, FoldingRange, FoldingRangeParams,
     FoldingRangeProviderCapability, InitializeParams, InitializeResult, OneOf, ServerCapabilities,
-    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
+    ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 
+use crate::analysis::AnalysisStore;
 use crate::documents::DocumentStore;
-use crate::folding::get_folding_ranges;
-use crate::symbols::get_symbols;
 
 /// The language server.
 #[derive(Debug, Default)]
@@ -19,6 +18,9 @@ pub struct Server {
     /// Contents of every open document. They're behind a lock because `LanguageServer`
     /// implementers have to be ```Send + Sync + `static.```
     documents: RwLock<DocumentStore>,
+
+    /// Analysis results of every open document. Behind a lock for the same reason.
+    analyses: RwLock<AnalysisStore>,
 }
 
 impl Server {
@@ -33,6 +35,22 @@ impl Server {
         self.documents
             .write()
             .expect("document store lock poisoned")
+    }
+
+    /// Lock the analyses, panicking only if a previous handler panicked while
+    /// holding the write lock.
+    fn analyses(&self) -> RwLockWriteGuard<'_, AnalysisStore> {
+        self.analyses.write().expect("analysis store lock poisoned")
+    }
+
+    /// Re-runs every analysis over an open document's current tree.
+    fn analyze(&self, uri: &Uri) {
+        let documents = self.store();
+        let Some(document) = documents.get(uri) else {
+            return;
+        };
+
+        self.analyses().analyze(uri, &document.tree, &document.text);
     }
 }
 
@@ -56,31 +74,41 @@ impl LanguageServer for Server {
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
         self.store().open(params.text_document);
+        self.analyze(&uri);
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let uri = params.text_document.uri.clone();
         if let Err(err) = self.store().change(params) {
             eprintln!("zsh-lsp: ignoring textDocument/didChange: {err}");
+            return;
         }
+        self.analyze(&uri);
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        self.store().close(&params.text_document.uri);
+        let uri = params.text_document.uri;
+        self.store().close(&uri);
+        self.analyses().close(&uri);
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
-        let store = self.store();
-        let ranges = store.get(&params.text_document.uri).map(|doc| {
-            get_folding_ranges(&doc.tree)
-                .into_iter()
-                .map(|(start_line, end_line)| FoldingRange {
-                    start_line,
-                    end_line,
-                    ..Default::default()
-                })
-                .collect()
-        });
+        let analyses = self.analyses.read().expect("analysis store lock poisoned");
+        let ranges = analyses
+            .folding_ranges(&params.text_document.uri)
+            .map(|ranges| {
+                ranges
+                    .iter()
+                    .map(|&(start_line, end_line)| FoldingRange {
+                        start_line,
+                        end_line,
+                        ..Default::default()
+                    })
+                    .collect()
+            });
+
         Ok(ranges)
     }
 
@@ -88,10 +116,10 @@ impl LanguageServer for Server {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
-        let store = self.store();
-        let symbols = store
-            .get(&params.text_document.uri)
-            .map(|doc| get_symbols(&doc.tree, &doc.text));
+        let analyses = self.analyses.read().expect("analysis store lock poisoned");
+        let symbols = analyses
+            .symbols(&params.text_document.uri)
+            .map(|symbols| symbols.to_vec());
 
         Ok(symbols.map(DocumentSymbolResponse::Nested))
     }
@@ -136,6 +164,7 @@ mod tests {
             version: 1,
             text: text.to_string(),
         });
+        server.analyze(&uri(path));
     }
 
     #[tokio::test]
