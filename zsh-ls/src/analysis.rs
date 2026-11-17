@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use tower_lsp_server::ls_types::{DocumentSymbol, Uri};
+use tower_lsp_server::ls_types::{DocumentSymbol, FoldingRange, Uri};
 use tree_sitter::{Node, Tree, TreeCursor};
 
 use crate::folding::FoldingAnalyzer;
@@ -52,7 +52,7 @@ impl AnalysisStore {
     }
 
     /// The folding ranges found for `uri`.
-    pub fn folding_ranges(&self, uri: &Uri) -> Option<&[(u32, u32)]> {
+    pub fn folding_ranges(&self, uri: &Uri) -> Option<&[FoldingRange]> {
         self.documents
             .get(uri)
             .map(|analyses| analyses.folding.ranges())
@@ -124,7 +124,13 @@ mod tests {
 
         assert_eq!(
             store.folding_ranges(&uri("/tmp/a.zsh")),
-            Some(&[(0, 3)][..])
+            Some(
+                &[FoldingRange {
+                    start_line: 0,
+                    end_line: 3,
+                    ..Default::default()
+                }][..]
+            )
         );
         assert_eq!(symbol_names(&store, "/tmp/a.zsh"), ["foo"]);
     }

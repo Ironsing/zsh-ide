@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 
+use tower_lsp_server::ls_types::FoldingRange;
 use tree_sitter::Node;
 
 use crate::analysis::Analyzer;
@@ -31,7 +32,7 @@ const FOLDABLE_NODE_KINDS: &[&str] = &[
 /// Collects the foldable regions of one document.
 #[derive(Debug, Default)]
 pub struct FoldingAnalyzer {
-    ranges: Vec<(u32, u32)>,
+    ranges: Vec<FoldingRange>,
 
     // Nested watched nodes can share the same line span (e.g. a function and its
     // `{ ... }` body are both `(start, end)`). This is to dedup those ranges.
@@ -39,8 +40,8 @@ pub struct FoldingAnalyzer {
 }
 
 impl FoldingAnalyzer {
-    /// The foldable regions found, as `(start_line, end_line)` pairs.
-    pub fn ranges(&self) -> &[(u32, u32)] {
+    /// The foldable regions found, in document order.
+    pub fn ranges(&self) -> &[FoldingRange] {
         &self.ranges
     }
 }
@@ -68,7 +69,11 @@ impl Analyzer for FoldingAnalyzer {
 
         // Skip nodes that span a single line, and nodes repeating a span.
         if start < end && self.seen.insert((start, end)) {
-            self.ranges.push((start, end));
+            self.ranges.push(FoldingRange {
+                start_line: start,
+                end_line: end,
+                ..Default::default()
+            });
         }
     }
 }
@@ -86,8 +91,17 @@ mod tests {
         parser.parse(text, None).expect("tree is produced")
     }
 
+    /// A folding range spanning `start_line` to `end_line`.
+    fn range(start_line: u32, end_line: u32) -> FoldingRange {
+        FoldingRange {
+            start_line,
+            end_line,
+            ..Default::default()
+        }
+    }
+
     /// The ranges the analyzer finds for `text`, parsed on its own.
-    fn folding_ranges(text: &str) -> Vec<(u32, u32)> {
+    fn folding_ranges(text: &str) -> Vec<FoldingRange> {
         let tree = parse(text);
         let mut analyzer = FoldingAnalyzer::default();
         crate::analysis::run(&tree, text, &mut [&mut analyzer]);
@@ -98,7 +112,7 @@ mod tests {
     fn function_definition_yields_range() {
         assert_eq!(
             folding_ranges("foo() {\n  echo hi\n  echo bye\n}\n"),
-            vec![(0, 3)]
+            vec![range(0, 3)]
         );
     }
 
@@ -110,7 +124,7 @@ mod tests {
 
     #[test]
     fn two_line_function_yields_range() {
-        assert_eq!(folding_ranges("foo() {\n}\n"), vec![(0, 1)]);
+        assert_eq!(folding_ranges("foo() {\n}\n"), vec![range(0, 1)]);
     }
 
     #[test]
@@ -124,7 +138,7 @@ mod tests {
         // their ranges shrink back to their last content line.
         assert_eq!(
             folding_ranges("if a; then\n  x\nelif b; then\n  y\nelse\n  z\nfi\n"),
-            vec![(0, 6), (2, 3), (4, 5)]
+            vec![range(0, 6), range(2, 3), range(4, 5)]
         );
     }
 
@@ -134,7 +148,7 @@ mod tests {
         // collapses to a single range.
         assert_eq!(
             folding_ranges("{\n  echo try\n} always {\n  echo cleanup\n}\n"),
-            vec![(0, 4), (2, 4)]
+            vec![range(0, 4), range(2, 4)]
         );
     }
 
@@ -142,15 +156,15 @@ mod tests {
     fn loop_forms_yield_ranges() {
         assert_eq!(
             folding_ranges("for x in a b; do\n  echo $x\ndone\n"),
-            vec![(0, 2)]
+            vec![range(0, 2)]
         );
         assert_eq!(
             folding_ranges("while true; do\n  echo hi\n  break\ndone\n"),
-            vec![(0, 3)]
+            vec![range(0, 3)]
         );
         assert_eq!(
             folding_ranges("until false; do\n  echo hi\n  break\ndone\n"),
-            vec![(0, 3)]
+            vec![range(0, 3)]
         );
     }
 
@@ -160,7 +174,7 @@ mod tests {
             folding_ranges(
                 "case $1 in\n  a)\n    echo a\n    echo a2\n    ;;\n  b)\n    echo b\n    echo b2\n    ;;\nesac\n"
             ),
-            vec![(0, 9), (1, 4), (5, 8)]
+            vec![range(0, 9), range(1, 4), range(5, 8)]
         );
     }
 }

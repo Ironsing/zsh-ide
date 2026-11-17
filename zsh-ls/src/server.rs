@@ -98,16 +98,7 @@ impl LanguageServer for Server {
         let analyses = self.analyses.read().expect("analysis store lock poisoned");
         let ranges = analyses
             .folding_ranges(&params.text_document.uri)
-            .map(|ranges| {
-                ranges
-                    .iter()
-                    .map(|&(start_line, end_line)| FoldingRange {
-                        start_line,
-                        end_line,
-                        ..Default::default()
-                    })
-                    .collect()
-            });
+            .map(|ranges| ranges.to_vec());
 
         Ok(ranges)
     }
